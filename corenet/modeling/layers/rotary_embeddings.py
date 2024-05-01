@@ -3,7 +3,7 @@
 # Copyright (C) 2024 Apple Inc. All Rights Reserved.
 #
 
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
 from torch import Tensor
@@ -132,6 +132,8 @@ class RotaryEmbedding(torch.nn.Module):
         self,
         query: torch.Tensor,
         key: torch.Tensor,
+        key_pos_ids: Optional[Tensor] = None,
+        query_pos_ids: Optional[Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         The forward function of RoPE embeddings.
@@ -141,6 +143,10 @@ class RotaryEmbedding(torch.nn.Module):
                 [Batch, number of query heads, number of query tokens, model dimension].
             key: Key embeddings in the transformer model. The shape of key embeddings is
                 [Batch, number of key heads, number of key tokens, model dimension].
+            key_pos_ids: Optional positional indices for key embeddings. The shape of key_pos_ids is
+                [Batch, number of key tokens].
+            query_pos_ids: Optional positional indices for query embeddings.
+                The shape of query_pos_ids is [Batch, number of query tokens].
 
         Returns:
             A tuple containing the query and key embeddings with positional information. The shape of the returned query
@@ -153,6 +159,9 @@ class RotaryEmbedding(torch.nn.Module):
         dim = key.shape[-1]
         key_len = key.shape[2]
         query_len = query.shape[2]
+        B = query.shape[0]
+        n_query_heads = query.shape[1]
+        n_key_heads = key.shape[1]
 
         assert dim == self.model_dim
         assert key.device == query.device
@@ -173,15 +182,57 @@ class RotaryEmbedding(torch.nn.Module):
         self._compute_sin_cos_embeddings(
             key_len, key_device=key_float.device, key_dtype=key_float.dtype
         )
+        # _cached_sin is of shape [1, 1, number of key tokens, model_dim]
+        # _cached_cos is of shape [1, 1, number of key tokens, model_dim]
+        if key_pos_ids is not None:
+            # assert key_pos_ids.shape is [Batch, number of key tokens]
+            assert key_pos_ids.shape  == (B, key_len)
+
+            key_pos_ids_flat = key_pos_ids.view(-1)
+            key_pos_emb_sin = self._cached_sin[..., key_pos_ids_flat, :].view(
+                B, 1, key_len, dim
+            )
+            key_pos_emb_cos = self._cached_cos[..., key_pos_ids_flat, :].view(
+                B, 1, key_len, dim
+            )
+
+        else:
+            key_pos_emb_sin = self._cached_sin[..., :key_len, :]
+            key_pos_emb_cos = self._cached_cos[..., :key_len, :]
+
+        if query_pos_ids is not None:
+            # assert query_pos_ids.shape is [Batch, number of query tokens]
+            assert query_pos_ids.shape == (B, query_len)
+
+            query_pos_ids_flat = query_pos_ids.view(-1)
+            query_pos_emb_sin = self._cached_sin[..., query_pos_ids_flat, :].view(
+                B, 1, query_len, dim
+            )
+            query_pos_emb_cos = self._cached_cos[..., query_pos_ids_flat, :].view(
+                B, 1, query_len, dim
+            )
+        else:
+            query_pos_emb_sin = self._cached_sin[..., key_len - query_len : key_len, :]
+            query_pos_emb_cos = self._cached_cos[..., key_len - query_len : key_len, :]
+
+        #print("Shape of query_float before applying rotary embeddings:", query_float.shape)
+        #print("Shape of query_pos_emb_sin:", query_pos_emb_sin.shape)
+        #print("Shape of query_pos_emb_cos:", query_pos_emb_cos.shape)
+
         query_float = _apply_rotary_pos_emb(
             x=query_float,
-            pos_sin=self._cached_sin[..., key_len - query_len : key_len, :],
-            pos_cos=self._cached_cos[..., key_len - query_len : key_len, :],
+            pos_sin=query_pos_emb_sin,
+            pos_cos=query_pos_emb_cos,
         )
+
+        #print("Shape of key_float before applying rotary embeddings:", key_float.shape)
+        #print("Shape of key_pos_emb_sin:", key_pos_emb_sin.shape)
+        #print("Shape of key_pos_emb_cos:", key_pos_emb_cos.shape)
+
         key_float = _apply_rotary_pos_emb(
             x=key_float,
-            pos_sin=self._cached_sin[..., :key_len, :],
-            pos_cos=self._cached_cos[..., :key_len, :],
+            pos_sin=key_pos_emb_sin,
+            pos_cos=key_pos_emb_cos,
         )
 
         return query_float.type_as(query), key_float.type_as(key)

@@ -20,6 +20,9 @@ from corenet.utils import logger
 from corenet.utils.object_utils import apply_recursively
 
 
+import wandb
+
+
 class Statistics(object):
     def __init__(
         self,
@@ -91,7 +94,7 @@ class Statistics(object):
         self.batch_time += batch_time
         self.batch_counter += 1
 
-    def _avg_statistics_all(self, sep=": ", metrics=None) -> List[str]:
+    def _avg_statistics_all(self, sep=": ", metrics=None, wandb=None, wandb_extra=None) -> List[str]:
         """
         This function computes average statistics of all metrics and returns them as a list of strings.
 
@@ -101,6 +104,12 @@ class Statistics(object):
         """
         if metrics is None:
             metrics = self._compute_avg_statistics_all()
+
+        if wandb is not None:
+            if wandb_extra is None:
+                wandb.log(metrics)
+            else:
+                wandb.log(metrics | wandb_extra)
 
         return [
             self.metric_dict[name].summary_string(name, sep, avg)
@@ -167,9 +176,10 @@ class Statistics(object):
         total_samples: int,
         elapsed_time: float,
         learning_rate: float or list,
+        wandb=None,
     ) -> None:
         if self.is_master_node:
-            metric_stats = self._avg_statistics_all()
+            metric_stats = self._avg_statistics_all(wandb=wandb, wandb_extra={'n_processed_samples': n_processed_samples})
             el_time_str = "Elapsed time: {:5.2f}".format(time.time() - elapsed_time)
             if isinstance(learning_rate, float):
                 lr_str = "LR: {:1.6f}".format(learning_rate)

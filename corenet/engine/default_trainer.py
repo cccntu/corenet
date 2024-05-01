@@ -40,6 +40,8 @@ from corenet.utils.ddp_utils import dist_barrier, is_master
 from corenet.utils.tensor_utils import reduce_tensor_sum
 
 
+import wandb
+
 class DefaultTrainer(object):
     """
     Default training and validation engine.
@@ -95,6 +97,8 @@ class DefaultTrainer(object):
         self.train_iterations = start_iteration
 
         self.is_master_node = is_master(opts)
+        if self.is_master_node:
+            wandb.init(project='corenet', config=opts)
         self.max_iterations_reached = False
         self.max_iterations = getattr(
             self.opts, "scheduler.max_iterations", DEFAULT_ITERATIONS
@@ -311,6 +315,19 @@ class DefaultTrainer(object):
             ):
                 # prediction
                 pred_label = self.model(samples)
+                if batch_id % self.log_freq == 0 and self.is_master_node:
+                    if isinstance(pred_label, dict):
+                        mod_logits = pred_label.get("mod_logits", [])
+                        if mod_logits:
+                            from corenet.utils.object_utils import flatten_to_dict
+                            # mod_logits is a list of logits (may be none)
+                            log = {f'mod_logits.{i}': wandb.Histogram(x['mod_router1_logits'].detach().float().cpu().view(-1)) for i, x in enumerate(mod_logits) if x is not None}
+                            log |= {f'mod_topk_logits.{i}': wandb.Histogram(x['mod_topk_logits'].detach().float().cpu().view(-1)) for i, x in enumerate(mod_logits) if x is not None}
+                            log |= {f'mod_topk_weights.{i}': wandb.Histogram(x['mod_topk_weights'].detach().float().cpu().view(-1)) for i, x in enumerate(mod_logits) if x is not None}
+                            log |= {'batch_id': batch_id}
+                            wandb.log(log)
+
+
                 # compute loss
                 loss_dict_or_tensor: Union[Dict, Tensor] = self.criteria(
                     input_sample=samples,
@@ -382,6 +399,7 @@ class DefaultTrainer(object):
                     total_samples=self.max_iterations,
                     learning_rate=lr,
                     elapsed_time=epoch_start_time,
+                    wandb=wandb,
                 )
 
             batch_load_start = time.time()
@@ -457,6 +475,7 @@ class DefaultTrainer(object):
                 ):
                     # prediction
                     pred_label = model(samples)
+
                     # compute loss
                     loss_dict_or_tensor = self.criteria(
                         input_sample=samples, prediction=pred_label, target=targets

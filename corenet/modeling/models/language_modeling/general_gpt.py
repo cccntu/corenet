@@ -80,6 +80,14 @@ class GPTConfig:
     # This allows flexibility in token lengths during training or fine-tuning.
     rope_max_length: int = 4096
 
+    # MoD-specific parameters.
+    use_mod: bool = False
+    mod_dropout_p: float = 0.0 # dropout probability for mod, not tested yet
+    mod_sample_factor: Union[Number, List[Number]] = (1/4, 1) # repeats this pattern
+    mod_window_size: int = 1
+    router2_dim: int = 256 # hidden dimension of the router2
+
+
     def __post_init__(self) -> None:
         if self.num_gqa_groups is not None:
             head_multiple_of = self.num_gqa_groups
@@ -209,6 +217,31 @@ gpt_configs = {
         ffn_multipliers=(0.5, 4.0),
         qkv_multipliers=(0.5, 1.0),
     ),
+    "MoDOpenELM-270M": dict(
+        num_transformer_layers=16,
+        model_dim=1280,
+        head_dim=64,
+        num_gqa_groups=4,
+        normalize_qk_projections=True,
+        share_input_output_layers=True,
+        # Vary the FFN and QKV multiplier to create variable FFN and attention layers respectively.
+        ffn_multipliers=(0.5, 4.0),
+        qkv_multipliers=(0.5, 1.0),
+        use_mod=True,
+    ),
+    "MoDOpenELM-270M-v2": dict(
+        num_transformer_layers=17, # add one layer so the bottom layer is not mod
+        model_dim=1280,
+        head_dim=64,
+        num_gqa_groups=4,
+        normalize_qk_projections=True,
+        share_input_output_layers=True,
+        # Vary the FFN and QKV multiplier to create variable FFN and attention layers respectively.
+        ffn_multipliers=(0.5, 4.0),
+        qkv_multipliers=(0.5, 1.0),
+        use_mod=True,
+        mod_sample_factor=(1, 1/4),
+    ),
     "OpenELM-450M": dict(
         num_transformer_layers=20,
         model_dim=1536,
@@ -322,6 +355,8 @@ class MultiHeadCausalAttention(nn.Module):
         past_values: Optional[Tensor] = None,
         use_kv_cache: bool = False,
         is_causal: bool = True,
+        past_pos_ids: Optional[Tensor] = None,
+        x_pos_ids: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
         """
         Forward pass of multi-head self-attention.
@@ -333,6 +368,8 @@ class MultiHeadCausalAttention(nn.Module):
             past_values: Tensor storing the cached values. The shape of the tensor is the same as 'past_keys'.
             use_kv_cache: Cache the output of key and value projection layers for faster inference.
             is_causal: Specifies whether to apply causal masking in scaled dot-product attention.
+            past_pos_ids: Optional tensor containing positional indices for past keys and values.
+            x_pos_ids: Optional tensor containing positional indices for the current input x.
 
         Returns:
             The output of the same shape as the input, optionally with a tensor containing cached keys and values.
@@ -367,12 +404,29 @@ class MultiHeadCausalAttention(nn.Module):
                 # concatenate past and current keys along the sequence dimension.
                 keys = torch.cat([past_keys, keys], dim=-2)
                 values = torch.cat([past_values, values], dim=-2)
+                assert (past_pos_ids is not None and x_pos_ids is not None) or (past_pos_ids is None and x_pos_ids is None), "Both past_pos_ids and x_pos_ids must be either provided or None."
+                if past_pos_ids is not None:
+                    key_pos_ids = torch.cat([past_pos_ids, x_pos_ids], dim=-1)
+                else:
+                    key_pos_ids = None
 
             past_keys = keys
             past_values = values
+            past_pos_ids = key_pos_ids
+        else:
+            past_pos_ids = None
 
+
+        # queries: [batch_size, num_q_heads, seq_length, head_dim],
+        # keys: [batch_size, num_k_heads, seq_length, head_dim],
+        # values: [batch_size, num_v_heads, seq_length, head_dim]
         # Add positional embedding
-        queries, keys = self.pos_embedding(queries, keys)
+        if past_pos_ids is None:
+            # x_pos_ids is used for both queries and keys. they can be none
+            queries, keys = self.pos_embedding(queries, keys, key_pos_ids=x_pos_ids, query_pos_ids=x_pos_ids)
+        else:
+            # query and key have different pos ids
+            queries, keys = self.pos_embedding(queries, keys, key_pos_ids=key_pos_ids, query_pos_ids=x_pos_ids)
 
         if self.num_groups != 1:
             # Group-query attention.
@@ -473,7 +527,23 @@ class FeedForwardNetwork(nn.Module):
         else:
             return self.proj_2(self.act(self.proj_1(x)))
 
+from typing import Optional, Tuple
+def topk_with_window(scores, topk, window_size):
+    if window_size <= 1:
+        topk_scores, topk_indices = torch.topk(scores, topk, dim=1, sorted=False)
+        return topk_scores, topk_indices
 
+    B, T, one = scores.size() # batch size, sequence length, embedding dimensionality (n_embd)
+    n_window = T // window_size
+    k_per_window = topk // n_window
+    k2 = k_per_window * n_window
+    #assert T % window_size == 0, f"sequence length {T} must be divisible by window size {window_size}"
+    scores = scores.view(B, T//window_size, window_size, 1)
+    topk_scores, topk_indices = torch.topk(scores, k_per_window, dim=2, sorted=False)
+    topk_scores = topk_scores.view(B, k2, 1)
+    topk_indices = (topk_indices # B, T//window_size, k_per_window, 1
+                    + torch.arange(0, T, window_size, device=scores.device).view(1, -1, 1, 1)).view(B, k2, 1)
+    return topk_scores, topk_indices
 class TransformerDecoderLayer(nn.Module):
     """Transformer decoder layer.
 
@@ -503,6 +573,32 @@ class TransformerDecoderLayer(nn.Module):
             num_features=model_config.model_dim,
             norm_type=model_config.normalization_layer_name,
         )
+        self.use_mod = model_config.use_mod
+        self.mod_dropout_p = model_config.mod_dropout_p
+        if self.use_mod:
+            def get_mod_sample_factor(idx):
+                if isinstance(model_config.mod_sample_factor, Number):
+                    return model_config.mod_sample_factor
+                else:
+                    return model_config.mod_sample_factor[idx % len(model_config.mod_sample_factor)]
+            self.mod_sample_factor = get_mod_sample_factor(layer_idx)
+            self.mod_window_size = model_config.mod_window_size
+            if self.mod_sample_factor != 1:
+                self.router1 = nn.Linear(model_config.model_dim, 1)
+                self.mod_norm = get_normalization_layer(
+                    opts,
+                    num_features=model_config.model_dim,
+                    norm_type=model_config.normalization_layer_name,
+                )
+
+            # TODO: add training for router2
+            """
+            self.router2 = nn.Sequential(
+                nn.Linear(model_config.model_dim, model_config.router2_dim),
+                nn.ReLU(),
+                nn.Linear(model_config.router2_dim, 1)
+            )
+            """
 
     def forward(
         self,
@@ -527,15 +623,55 @@ class TransformerDecoderLayer(nn.Module):
             The output of the same shape as the input, optionally with a tensor containing cached keys and values.
         """
         # Pre-norm attention.
-        y_attn = self.attn_norm(x)
-        y_attn, past_keys, past_values = self.attn(
-            y_attn, past_keys, past_values, use_kv_cache, is_causal
-        )
-        y_attn = x + y_attn
+        if not self.use_mod or self.mod_sample_factor == 1:
+            y_attn = self.attn_norm(x)
+            y_attn, past_keys, past_values = self.attn(
+                y_attn, past_keys, past_values, use_kv_cache, is_causal
+            )
+            y_attn = x + y_attn
+            # Pre-norm FFN.
+            y_ffn = y_attn + self.ffn(self.ffn_norm(y_attn))
+            return {'output': y_ffn, 'past_keys': past_keys, 'past_values': past_values}
+        else:
+            B, L, D = x.shape
+            topk = int(L * self.mod_sample_factor)
+            x_router = self.mod_norm(x)
+            router1_logits = self.router1(x_router)
 
-        # Pre-norm FFN.
-        y_ffn = y_attn + self.ffn(self.ffn_norm(y_attn))
-        return y_ffn, past_keys, past_values
+            # TODO: handle inference later
+            topk_scores, topk_indices = topk_with_window(router1_logits, topk, self.mod_window_size)
+
+
+            assert topk_scores.size() == (B, topk, 1)
+            assert topk_indices.size() == (B, topk, 1)
+            output = x.clone() # place holder
+            topk_x = torch.gather(x, 1, topk_indices.expand(-1, -1, D))
+
+            position_ids = torch.arange(L, device=x.device, dtype=torch.long).view(1, -1).expand(B, -1)
+            topk_position_ids = torch.gather(position_ids, 1, topk_indices.view(B, -1))
+            topk_position_ids = topk_position_ids.view(B, topk)
+
+            y_attn = self.attn_norm(topk_x)
+            y_attn, _, _ = self.attn(
+                y_attn, None, None, False, is_causal, x_pos_ids=topk_position_ids
+            )
+            y_attn = topk_x + y_attn
+            y_ffn = self.ffn(self.ffn_norm(topk_x + y_attn))
+
+
+            mod_weights = 1 + F.dropout(topk_scores, p=self.mod_dropout_p, training=self.training)
+            topk_y = (y_attn + y_ffn) * mod_weights
+
+            output.scatter_add_(1, topk_indices.expand(-1, -1, D), topk_y)
+            return {'output': output, 'past_keys': past_keys, 'past_values': past_values,
+                    'mod': {
+                        'mod_router1_logits': router1_logits,
+                        'mod_topk_logits': topk_scores,
+                        'mod_topk_weights': mod_weights,
+                        #'mod_scale': self.mod_scale,
+                    },
+            }
+
 
 
 @MODEL_REGISTRY.register(name="general_gpt", type="language_modeling")
@@ -606,6 +742,7 @@ class GeneralGPTModel(BaseLanguageModel):
             )
         self.reset_parameters(model_config=model_config)
         self.num_transformer_layers = model_config.num_transformer_layers
+        self.model_config = model_config
 
     @classmethod
     def add_arguments(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -669,8 +806,7 @@ class GeneralGPTModel(BaseLanguageModel):
             The expected shape of the values is
                 {
                     "logits": [batch size, sequence length, vocabular size],
-                    "past_keys": [ [batch size, number of key heads, sequence length, head dimension] ] * number of transformer layers,
-                    "past_values": [ [batch size, number of value heads, sequence length, head dimension] ] * number of transformer layers,
+                    "past_keys": [ [batch size, number of key heads, sequence length, head dimension] ] * number of transformer layers, "past_values": [ [batch size, number of value heads, sequence length, head dimension] ] * number of transformer layers,
                 }
             2. Logits tensor is returned. The shape of logits tensor is [batch size, sequence length, vocabulary size].
 
@@ -722,16 +858,27 @@ class GeneralGPTModel(BaseLanguageModel):
 
         x = self.token_embeddings(input_ids)
 
+        if self.model_config.use_mod:
+            mod_logits = [None] * self.num_transformer_layers
+        else:
+            mod_logits = None
+
         for layer_idx in range(self.num_transformer_layers):
             past_keys_layer_i = past_keys[layer_idx]
             past_values_layer_i = past_values[layer_idx]
 
-            x, past_keys_layer_i, past_values_layer_i = self.layers[layer_idx](
+            layer_output = self.layers[layer_idx](
                 x, past_keys_layer_i, past_values_layer_i, use_kv_cache, is_causal
             )
+            x = layer_output['output']
+            past_keys_layer_i = layer_output['past_keys']
+            past_values_layer_i = layer_output['past_values']
             # update the kv cache
             past_keys[layer_idx] = past_keys_layer_i
             past_values[layer_idx] = past_values_layer_i
+            if self.model_config.use_mod:
+                if 'mod' in layer_output:
+                    mod_logits[layer_idx] = layer_output['mod']
 
         x = self.norm(x)
         if self.classifier is None:
@@ -744,9 +891,10 @@ class GeneralGPTModel(BaseLanguageModel):
                 "logits": logits,
                 "past_keys": past_keys,
                 "past_values": past_values,
+                'mod_logits': mod_logits,
             }
         else:
-            return logits
+            return {"logits": logits, "mod_logits": mod_logits}
 
     def get_fsdp_wrap_policy(
         self,
