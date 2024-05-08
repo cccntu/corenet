@@ -941,3 +941,133 @@ class GeneralGPTModel(BaseLanguageModel):
                 "ffn.proj_2.weight"
             ):
                 torch.nn.init.normal_(param, mean=0.0, std=std)
+
+# implement MLA (multi-haed latent attention)
+
+class MultiHeadLatentAttention(nn.Module):
+    """Multi-head latent attention.
+
+    Args:
+        opts: Command-line arguments.
+        model_config: Model configuration.
+        layer_idx: Layer index.
+    """
+    def __init__(self, opts: argparse.Namespace, model_config: GPTConfig, layer_idx: int) -> None:
+        super().__init__()
+        self.opts = opts
+        self.model_config = model_config
+        self.layer_idx = layer_idx
+
+        # d_c
+        kv_rank = self.model_config.mla_kv_rank
+        # d'_c
+        q_rank = self.model_config.mla_q_rank
+        # note:  head_dim referes to the non-rotary head dim, not the total head dim
+        head_dim = self.model_config.head_dim
+        # d^R_h : number of rotary dim in each head
+        rotary_head_dim = self.model_config.rotary_head_dim
+        num_kv_heads = self.model_config.num_kv_heads[layer_idx]
+        num_q_heads = self.model_config.num_query_heads[layer_idx]
+
+        d = self.model_config.model_dim
+        # W^DKV
+        self.down_kv = LinearLayer(in_features=d, out_features=kv_rank, bias=False)
+        # W^UK
+        self.up_k = LinearLayer(in_features=kv_rank, out_features=num_kv_heads * head_dim, bias=False)
+        # W^UV
+        self.up_v = LinearLayer(in_features=kv_rank, out_features=num_kv_heads * head_dim, bias=False)
+
+        # W^DQ
+        self.down_q = LinearLayer(in_features=d, out_features=q_rank, bias=False)
+        # W^UQ
+        self.up_q = LinearLayer(in_features=q_rank, out_features=num_q_heads * head_dim, bias=False)
+        # W^QR
+        self.q_rotary = LinearLayer(in_features=q_rank, out_features=num_q_heads * rotary_head_dim, bias=False)
+        # W^KR: all heads's keys share the same rotary dims
+        self.k_rotary = LinearLayer(in_features=d, out_features=rotary_head_dim, bias=False)
+
+        self.pos_embedding = RotaryEmbedding(
+            model_dim=model_config.rotary_head_dim,
+            max_seq_length=model_config.rope_max_length,
+            freq_constant=model_config.rope_freq_constant,
+        )
+
+        self.out_proj = LinearLayer(
+            in_features=num_q_heads * head_dim,
+            out_features=d,
+            bias=False,
+        )
+
+        # note:
+        # - up_q and q_rotary can be combined into one layer
+        # - up_k and up_v can be combined into one layer
+        # - down_kv, down_q, and k_rotary can be combined into one layer
+
+
+    def forward(self, x: Tensor, positions_ids: Tensor,
+                past_keys: Optional[Tensor] = None,
+                past_values: Optional[Tensor] = None,
+                use_kv_cache: bool = False,
+                is_causal: bool = True) -> Tensor:
+        # note RE: caching
+        # we need to cache k_R and c_KV, we use the common variable names (past_keys, past_values) for (k_R, c_KV) respectively
+        B, L, D = x.shape
+
+        num_q_heads = self.model_config.num_query_heads[self.layer_idx]
+        num_kv_heads = self.model_config.num_kv_heads[self.layer_idx]
+        head_dim = self.model_config.head_dim
+        rotary_head_dim = self.model_config.rotary_head_dim
+
+        ## q does not need caching
+        c_Q = self.down_q(x) # B, L, q_rank
+        q_C = self.up_q(c_Q) # B, L, num_q_heads * head_dim
+        q_R = self.q_rotary(c_Q) # B, L, num_q_heads * rotary_head_dim
+
+        ## these 2 need caching
+        k_R = self.k_rotary(x) # B, L, rotary_head_dim
+        c_KV = self.down_kv(x) # B, L, kv_rank
+
+        if use_kv_cache:
+            if past_keys is not None:
+                assert past_values is not None
+                # concatenate past and current keys along the sequence dimension.
+                k_R = torch.cat([past_keys, k_R], dim=-2)
+                v_C = torch.cat([past_values, v_C], dim=-2)
+
+            past_keys = k_R
+            past_values = v_C
+            S = k_R.size(1)
+        else:
+            S = L
+
+        k_C = self.up_k(c_KV) # B, L, num_kv_heads * head_dim
+        v_C = self.up_v(c_KV).view(B, L, num_kv_heads, head_dim) # B, L, num_kv_heads, head_dim
+
+        ## apply RoPE
+        # q_R: B, L, num_q_heads * rotary_head_dim -> B, L, num_q_heads, rotary_head_dim
+        q_R = q_R.view(B, L, num_q_heads, rotary_head_dim)
+        k_R = k_R.view(B, S, 1, rotary_head_dim).expand(-1, -1, num_kv_heads, -1) # B, S, num_kv_heads, rotary_head_dim
+        q_R, k_R = self.pos_embedding(q_R, k_R, positions_ids)
+
+        ## combine rotary and non-rotary dims
+        q = torch.cat((q_C, q_R), dim=-1) # B, L, num_q_heads, (head_dim + rotary_head_dim)
+        k = torch.cat((k_C, k_R), dim=-1) # B, S, num_kv_heads, (head_dim + rotary_head_dim)
+
+        # The output of this operation has size of [batch_size, num_q_heads, seq_length, head_dim]
+        attn_output = F.scaled_dot_product_attention(
+            q.transpose(1, 2), # B, num_q_heads, L, (head_dim + rotary_head_dim)
+            k.transpose(1, 2), # B, num_kv_heads, S, (head_dim + rotary_head_dim)
+            v_C.transpose(1, 2), # B, num_kv_heads, S, head_dim
+            attn_mask=None,
+            dropout_p=0,
+            is_causal=is_causal,
+        )
+        # [batch_size, num_q_heads, seq_length, head_dim] --> [batch_size, seq_length, num_q_heads, head_dim]
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        # [batch_size, seq_length, num_q_heads, head_dim] --> [batch_size, seq_length, num_q_heads * head_dim]
+        attn_output = attn_output.reshape(
+            B, L, num_q_heads * head_dim
+        )
+        # [batch_size, seq_length, num_q_heads * head_dim] --> [batch_size, seq_length, d_model]
+        out = self.out_proj(attn_output)
+        return out, past_keys, past_values
