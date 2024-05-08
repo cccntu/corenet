@@ -87,6 +87,12 @@ class GPTConfig:
     mod_window_size: int = 1
     router2_dim: int = 256 # hidden dimension of the router2
 
+    # MLA-specific parameters.
+    use_mla: bool = False
+    mla_kv_rank: int = 256  # 𝑑𝑐 is set to 4𝑑h (paper)
+    mla_q_rank: int = 512  # this is not clearly mentioned in the paper, it can be larger because it's not cached, but should be smaller than model_dim
+    rotary_head_dim: int = 32  # 𝑑𝑅h is set to 𝑑h/2 (paper)
+
 
     def __post_init__(self) -> None:
         if self.num_gqa_groups is not None:
@@ -241,6 +247,21 @@ gpt_configs = {
         qkv_multipliers=(0.5, 1.0),
         use_mod=True,
         mod_sample_factor=(1, 1/4),
+    ),
+    "OpenELM-270M-MLA": dict(
+        num_transformer_layers=16,
+        model_dim=1280,
+        head_dim=64,
+        num_gqa_groups=1, # disable group query attention
+        normalize_qk_projections=True,
+        share_input_output_layers=True,
+        # Vary the FFN and QKV multiplier to create variable FFN and attention layers respectively.
+        ffn_multipliers=(0.5, 4.0),
+        qkv_multipliers=(0.5, 1.0),
+        mla_kv_rank = 256, # 𝑑𝑐 is set to 4𝑑h (paper)
+        mla_q_rank = 512, # this is not clearly mentioned in the paper, it can be larger because it's not cached, but should be smaller than model_dim
+        rotary_head_dim = 32, # 𝑑𝑅h is set to 𝑑h/2 (paper)
+        use_mla=True,
     ),
     "OpenELM-450M": dict(
         num_transformer_layers=20,
@@ -557,9 +578,14 @@ class TransformerDecoderLayer(nn.Module):
         self, opts: argparse.Namespace, model_config: GPTConfig, layer_idx: int
     ) -> None:
         super().__init__()
-        self.attn = MultiHeadCausalAttention(
-            opts, model_config=model_config, layer_idx=layer_idx
-        )
+        if model_config.use_mla:
+            self.attn = MultiHeadLatentAttention(
+                opts, model_config=model_config, layer_idx=layer_idx
+            )
+        else:
+            self.attn = MultiHeadCausalAttention(
+                opts, model_config=model_config, layer_idx=layer_idx
+            )
         self.ffn = FeedForwardNetwork(
             opts, model_config=model_config, layer_idx=layer_idx
         )
@@ -1003,12 +1029,24 @@ class MultiHeadLatentAttention(nn.Module):
         # - up_k and up_v can be combined into one layer
         # - down_kv, down_q, and k_rotary can be combined into one layer
 
+    def extra_repr(self) -> str:
+        return (
+            super().extra_repr()
+            + f"model_dim={self.model_config.model_dim}, num_query_heads={self.model_config.num_query_heads[self.layer_idx]}, num_key_heads={self.model_config.num_kv_heads[self.layer_idx]}"
+        )
 
-    def forward(self, x: Tensor, positions_ids: Tensor,
-                past_keys: Optional[Tensor] = None,
-                past_values: Optional[Tensor] = None,
-                use_kv_cache: bool = False,
-                is_causal: bool = True) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        past_keys: Optional[Tensor] = None,
+        past_values: Optional[Tensor] = None,
+        use_kv_cache: bool = False,
+        is_causal: bool = True,
+        past_pos_ids: Optional[Tensor] = None,
+        x_pos_ids: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
+
+
         # note RE: caching
         # we need to cache k_R and c_KV, we use the common variable names (past_keys, past_values) for (k_R, c_KV) respectively
         B, L, D = x.shape
@@ -1020,8 +1058,8 @@ class MultiHeadLatentAttention(nn.Module):
 
         ## q does not need caching
         c_Q = self.down_q(x) # B, L, q_rank
-        q_C = self.up_q(c_Q) # B, L, num_q_heads * head_dim
-        q_R = self.q_rotary(c_Q) # B, L, num_q_heads * rotary_head_dim
+        q_C = self.up_q(c_Q).view(B, L, num_q_heads, head_dim) # B, L, num_q_heads, head_dim
+        q_R = self.q_rotary(c_Q).view(B, L, num_q_heads, rotary_head_dim) # B, L, num_q_heads, rotary_head_dim
 
         ## these 2 need caching
         k_R = self.k_rotary(x) # B, L, rotary_head_dim
@@ -1040,14 +1078,12 @@ class MultiHeadLatentAttention(nn.Module):
         else:
             S = L
 
-        k_C = self.up_k(c_KV) # B, L, num_kv_heads * head_dim
+        k_C = self.up_k(c_KV).view(B, L, num_kv_heads, head_dim) # B, L, num_kv_heads, head_dim
         v_C = self.up_v(c_KV).view(B, L, num_kv_heads, head_dim) # B, L, num_kv_heads, head_dim
 
         ## apply RoPE
-        # q_R: B, L, num_q_heads * rotary_head_dim -> B, L, num_q_heads, rotary_head_dim
-        q_R = q_R.view(B, L, num_q_heads, rotary_head_dim)
         k_R = k_R.view(B, S, 1, rotary_head_dim).expand(-1, -1, num_kv_heads, -1) # B, S, num_kv_heads, rotary_head_dim
-        q_R, k_R = self.pos_embedding(q_R, k_R, positions_ids)
+        q_R, k_R = self.pos_embedding(q_R, k_R)
 
         ## combine rotary and non-rotary dims
         q = torch.cat((q_C, q_R), dim=-1) # B, L, num_q_heads, (head_dim + rotary_head_dim)
