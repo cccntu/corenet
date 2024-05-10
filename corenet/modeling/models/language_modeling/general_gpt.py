@@ -998,6 +998,11 @@ class MultiHeadLatentAttention(nn.Module):
         d = self.model_config.model_dim
         # W^DKV
         self.down_kv = LinearLayer(in_features=d, out_features=kv_rank, bias=False)
+        self.down_kv_norm = get_normalization_layer(
+            opts,
+            num_features=kv_rank,
+            norm_type=self.model_config.normalization_layer_name,
+        )
         # W^UK
         self.up_k = LinearLayer(in_features=kv_rank, out_features=num_kv_heads * head_dim, bias=False)
         # W^UV
@@ -1005,6 +1010,11 @@ class MultiHeadLatentAttention(nn.Module):
 
         # W^DQ
         self.down_q = LinearLayer(in_features=d, out_features=q_rank, bias=False)
+        self.down_q_norm = get_normalization_layer(
+            opts,
+            num_features=q_rank,
+            norm_type=self.model_config.normalization_layer_name,
+        )
         # W^UQ
         self.up_q = LinearLayer(in_features=q_rank, out_features=num_q_heads * head_dim, bias=False)
         # W^QR
@@ -1057,13 +1067,13 @@ class MultiHeadLatentAttention(nn.Module):
         rotary_head_dim = self.model_config.rotary_head_dim
 
         ## q does not need caching
-        c_Q = self.down_q(x) # B, L, q_rank
+        c_Q = self.down_q_norm(self.down_q(x)) # B, L, q_rank
         q_C = self.up_q(c_Q).view(B, L, num_q_heads, head_dim) # B, L, num_q_heads, head_dim
         q_R = self.q_rotary(c_Q).view(B, L, num_q_heads, rotary_head_dim) # B, L, num_q_heads, rotary_head_dim
 
         ## these 2 need caching
         k_R = self.k_rotary(x) # B, L, rotary_head_dim
-        c_KV = self.down_kv(x) # B, L, kv_rank
+        c_KV = self.down_kv_norm(self.down_kv(x)) # B, L, kv_rank
 
         if use_kv_cache:
             if past_keys is not None:
