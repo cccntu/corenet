@@ -1073,15 +1073,13 @@ class MultiHeadLatentAttention(nn.Module):
         k_R = self.k_rotary(x) # B, L, rotary_head_dim
         c_KV = self.down_kv_norm(self.down_kv(x)) # B, L, kv_rank
 
+        # we only need to cache k_R and c_KV, we use the traditional variable names (past_keys, past_values) for (k_R, c_KV) respectively
         if use_kv_cache:
             if past_keys is not None:
                 assert past_values is not None
                 # concatenate past and current keys along the sequence dimension.
                 k_R = torch.cat([past_keys, k_R], dim=-2)
                 c_KV = torch.cat([past_values, c_KV], dim=-2)
-
-
-            # we need to cache k_R and c_KV, we use the traditional variable names (past_keys, past_values) for (k_R, c_KV) respectively
             past_keys = k_R
             past_values = c_KV
             S = k_R.size(1)
