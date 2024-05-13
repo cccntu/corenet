@@ -1057,8 +1057,6 @@ class MultiHeadLatentAttention(nn.Module):
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
 
 
-        # note RE: caching
-        # we need to cache k_R and c_KV, we use the common variable names (past_keys, past_values) for (k_R, c_KV) respectively
         B, L, D = x.shape
 
         num_q_heads = self.model_config.num_query_heads[self.layer_idx]
@@ -1080,10 +1078,12 @@ class MultiHeadLatentAttention(nn.Module):
                 assert past_values is not None
                 # concatenate past and current keys along the sequence dimension.
                 k_R = torch.cat([past_keys, k_R], dim=-2)
-                v_C = torch.cat([past_values, v_C], dim=-2)
+                c_KV = torch.cat([past_values, c_KV], dim=-2)
 
+
+            # we need to cache k_R and c_KV, we use the traditional variable names (past_keys, past_values) for (k_R, c_KV) respectively
             past_keys = k_R
-            past_values = v_C
+            past_values = c_KV
             S = k_R.size(1)
         else:
             S = L
